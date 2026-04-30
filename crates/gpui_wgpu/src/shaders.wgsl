@@ -931,6 +931,26 @@ struct ShaderQuad {
     iDate_w: f32,
     pad2: f32,
     pad3: f32,
+
+    // Sixteen app-provided scalars (mirrors `ShaderMaterial.params`). Built-in
+    // variants typically read `param_0..param_3` as a `vec4` palette /
+    // animation hint; the audio_reactive variant reads all sixteen.
+    param_0: f32,
+    param_1: f32,
+    param_2: f32,
+    param_3: f32,
+    param_4: f32,
+    param_5: f32,
+    param_6: f32,
+    param_7: f32,
+    param_8: f32,
+    param_9: f32,
+    param_10: f32,
+    param_11: f32,
+    param_12: f32,
+    param_13: f32,
+    param_14: f32,
+    param_15: f32,
 }
 @group(1) @binding(0) var<storage, read> b_shader_quads: array<ShaderQuad>;
 
@@ -948,6 +968,7 @@ const SHADER_QUAD_BLACK_HOLE: u32 = 10u;
 const SHADER_QUAD_HYPERSPACE_JUMP: u32 = 11u;
 const SHADER_QUAD_FERROFLUID: u32 = 12u;
 const SHADER_QUAD_APOLLONIAN_GASKET: u32 = 13u;
+const SHADER_QUAD_AUDIO_REACTIVE: u32 = 14u;
 
 fn shader_quad_corner_radii(shader_quad: ShaderQuad) -> Corners {
     return Corners(
@@ -960,6 +981,41 @@ fn shader_quad_corner_radii(shader_quad: ShaderQuad) -> Corners {
 
 fn shader_quad_resolution(shader_quad: ShaderQuad) -> vec3<f32> {
     return vec3<f32>(shader_quad.iResolution_x, shader_quad.iResolution_y, shader_quad.iResolution_z);
+}
+
+// First four user-supplied scalars as a vec4. Heavy variants accept this
+// as a "palette / intensity / speed / detail" hint.
+fn shader_quad_params4(shader_quad: ShaderQuad) -> vec4<f32> {
+    return vec4<f32>(
+        shader_quad.param_0,
+        shader_quad.param_1,
+        shader_quad.param_2,
+        shader_quad.param_3,
+    );
+}
+
+// Returns the i-th of the sixteen user-supplied scalars. Used by
+// audio_reactive to walk a per-band spectrum without exposing a 16-wide
+// signature on every variant.
+fn shader_quad_param(shader_quad: ShaderQuad, i: i32) -> f32 {
+    switch i {
+        case 0: { return shader_quad.param_0; }
+        case 1: { return shader_quad.param_1; }
+        case 2: { return shader_quad.param_2; }
+        case 3: { return shader_quad.param_3; }
+        case 4: { return shader_quad.param_4; }
+        case 5: { return shader_quad.param_5; }
+        case 6: { return shader_quad.param_6; }
+        case 7: { return shader_quad.param_7; }
+        case 8: { return shader_quad.param_8; }
+        case 9: { return shader_quad.param_9; }
+        case 10: { return shader_quad.param_10; }
+        case 11: { return shader_quad.param_11; }
+        case 12: { return shader_quad.param_12; }
+        case 13: { return shader_quad.param_13; }
+        case 14: { return shader_quad.param_14; }
+        default: { return shader_quad.param_15; }
+    }
 }
 
 struct ShaderQuadVarying {
@@ -2903,11 +2959,85 @@ fn shader_quad_dispatch(shader_quad: ShaderQuad, uv: vec2<f32>) -> vec3<f32> {
         case SHADER_QUAD_APOLLONIAN_GASKET: {
             rgb = shader_quad_apollonian_gasket(uv, resolution_xy, now);
         }
+        case SHADER_QUAD_AUDIO_REACTIVE: {
+            rgb = shader_quad_audio_reactive(shader_quad, uv, resolution_xy, now);
+            // The visualizer already consumes params; skip the post-pass.
+            return rgb;
+        }
         default: {
             rgb = shader_quad_plasma(uv, now);
         }
     }
+
+    // Optional post-pass: when the app has supplied non-zero params we apply
+    // a palette tint (param_0 in [0, 1]) and a gain (param_1 in [0, 4]) so
+    // any built-in becomes user-animatable without touching its body.
+    // Keeping the all-zero default a no-op preserves existing renders.
+    let p = shader_quad_params4(shader_quad);
+    let any_param = max(max(abs(p.x), abs(p.y)), max(abs(p.z), abs(p.w)));
+    if (any_param > 1e-5) {
+        let tint = mix(
+            vec3<f32>(1.0, 1.0, 1.0),
+            vec3<f32>(1.0 - rgb.r, 1.0 - rgb.g, 1.0 - rgb.b) + vec3<f32>(0.5, 0.4, 0.7),
+            clamp(p.x, 0.0, 1.0),
+        );
+        let gain = clamp(p.y, 0.0, 4.0);
+        let gained = rgb * tint * select(1.0, gain, gain > 1e-5);
+        // Subtle saturation push driven by param_2.
+        let luminance = dot(gained, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let saturated = mix(vec3<f32>(luminance), gained, 1.0 + clamp(p.z, -1.0, 2.0));
+        rgb = clamp(saturated, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     return rgb;
+}
+
+// Renders 16 vertical bars whose heights are driven by `param_0..param_15`.
+// Each band is expected in [0, 1]; values are clamped. Apps wire FFT
+// magnitudes (or any other 16-element series) into the params slot to drive
+// the visualizer.
+fn shader_quad_audio_reactive(
+    shader_quad: ShaderQuad,
+    uv: vec2<f32>,
+    resolution: vec2<f32>,
+    time: f32,
+) -> vec3<f32> {
+    let bands = 16.0;
+    let band_index_f = floor(uv.x * bands);
+    let band_index = clamp(i32(band_index_f), 0, 15);
+    let band_uv = fract(uv.x * bands);
+
+    let raw = shader_quad_param(shader_quad, band_index);
+    let height = clamp(raw, 0.0, 1.0);
+
+    // Inverted Y so the bar grows from the bottom.
+    let from_bottom = 1.0 - uv.y;
+    let bar_mask = step(band_uv, 0.86) * step(from_bottom, height);
+
+    // Glow head a few % above the bar tip.
+    let head_glow = smoothstep(height + 0.04, height, from_bottom)
+        * smoothstep(0.0, 1.0, height);
+
+    // Palette: cool->warm gradient along Y, plus a slow hue rotation in time.
+    let cool = vec3<f32>(0.20, 0.80, 1.00);
+    let warm = vec3<f32>(1.00, 0.40, 0.65);
+    let palette = mix(cool, warm, clamp(uv.y, 0.0, 1.0));
+    let pulse = 0.5 + 0.5 * sin(time * 2.0 + band_index_f * 0.6);
+
+    let bar_rgb = palette * (0.4 + 0.6 * pulse);
+    let head_rgb = vec3<f32>(1.0, 0.95, 0.85) * 0.9;
+
+    // Floor reflection so the bottom edge of the canvas glows when bars are tall.
+    // A faint horizontal scanline texture proportional to resolution so the
+    // visualizer subtly responds to canvas size and we use every parameter.
+    let scanline = 0.06 * sin(uv.y * resolution.y * 0.6);
+    let floor_glow = smoothstep(0.0, 0.18, from_bottom) * (1.0 - from_bottom)
+        * 0.35
+        * height;
+
+    return bar_rgb * bar_mask
+        + head_rgb * head_glow
+        + palette * floor_glow
+        + vec3<f32>(scanline) * bar_mask;
 }
 
 @fragment

@@ -538,6 +538,16 @@ pub struct ShaderMaterial {
     /// values are `1`, `2`, or `4`; renderers clamp out-of-range values.
     /// Default `1` (no supersampling) keeps the cost identical to before.
     pub supersample: u32,
+    /// Sixteen app-provided scalar parameters forwarded to the shader
+    /// program. Built-in variants read the first four as a `vec4` palette /
+    /// animation hint; the `audio_reactive` variant reads all sixteen as
+    /// frequency bands. Apps using runtime shaders can interpret each slot
+    /// however they want.
+    ///
+    /// Storage layout matches the WGSL `ShaderQuad.param_0..param_15`
+    /// scalars 1:1, so writing to this array is the canonical way to
+    /// animate built-in shaders from the host.
+    pub params: [f32; 16],
 }
 
 impl Default for ShaderMaterial {
@@ -552,6 +562,7 @@ impl Default for ShaderMaterial {
             mouse: [0.0; 4],
             date: [0.0; 4],
             supersample: 1,
+            params: [0.0; 16],
         }
     }
 }

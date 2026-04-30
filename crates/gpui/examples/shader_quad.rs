@@ -72,6 +72,10 @@ struct ShaderQuadExample {
     /// Per-pixel supersample factor passed to heavy variants. Driven by
     /// `GPUI_SUPERSAMPLE`. Default 1 (no supersampling).
     supersample: u32,
+    /// When true, the example animates `ShaderMaterial::params[0..3]` from
+    /// time and feeds them to the heavy/extreme rows so their dispatcher
+    /// post-pass tints/saturates the output. Driven by `GPUI_PARAMS_DEMO`.
+    params_demo: bool,
 }
 
 impl ShaderQuadExample {
@@ -85,7 +89,29 @@ impl ShaderQuadExample {
             smoothed_fps: 0.0,
             tile_scale: env_stress("GPUI_STRESS_TILES", 1),
             supersample: env_stress("GPUI_SUPERSAMPLE", 1),
+            params_demo: std::env::var("GPUI_PARAMS_DEMO")
+                .ok()
+                .map(|s| s.trim() == "1" || s.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
+    }
+
+    /// Animated params[0..3] when `params_demo` is on. Otherwise zeros so
+    /// the dispatcher post-pass is a no-op and rendering matches the
+    /// unmodified built-ins.
+    fn demo_params(&self, tick: &ShaderTick) -> [f32; 16] {
+        if !self.params_demo {
+            return [0.0; 16];
+        }
+        let t = tick.time;
+        let mut params = [0.0_f32; 16];
+        // Palette tint mix (0..1), oscillates with t.
+        params[0] = 0.5 + 0.5 * (t * 0.6).sin();
+        // Output gain (0..4), 1 = neutral. Stay near 1.0 so nothing clips.
+        params[1] = 1.0 + 0.4 * (t * 0.4 + 1.7).cos();
+        // Saturation push (-1..2), small swing around 0.
+        params[2] = 0.4 * (t * 0.8 + 0.3).sin();
+        params
     }
 
     fn tick(&mut self) -> ShaderTick {
@@ -119,6 +145,7 @@ impl ShaderQuadExample {
         name: &'static str,
         corner_radius: f32,
         supersample: u32,
+        params: [f32; 16],
     ) -> ShaderMaterial {
         ShaderMaterial {
             shader: ShaderSource::BuiltIn(SharedString::from(name)),
@@ -127,6 +154,7 @@ impl ShaderQuadExample {
             time_delta: tick.time_delta,
             frame: tick.frame,
             supersample,
+            params,
             ..Default::default()
         }
     }
@@ -138,8 +166,9 @@ impl ShaderQuadExample {
         corner_radius: f32,
         tile_height: f32,
         supersample: u32,
+        params: [f32; 16],
     ) -> impl IntoElement + use<> {
-        let material = self.material(tick, name, corner_radius, supersample);
+        let material = self.material(tick, name, corner_radius, supersample, params);
         let scaled_height = tile_height * self.tile_scale as f32;
 
         div()
@@ -184,22 +213,40 @@ impl Render for ShaderQuadExample {
         // Top row stays light (1x supersample). Extreme + crazier rows pick
         // up the configured supersample factor.
         let heavy_ss = self.supersample;
-        let warp_material = self.material(&tick, VERTEX_DISPLACEMENT_SHADER, 28.0, heavy_ss);
-        let camera_material = self.material(&tick, CAMERA_SHADER, 18.0, heavy_ss);
+        let demo_params = self.demo_params(&tick);
+        let no_params = [0.0_f32; 16];
+        let warp_material = self.material(
+            &tick,
+            VERTEX_DISPLACEMENT_SHADER,
+            28.0,
+            heavy_ss,
+            demo_params,
+        );
+        let camera_material = self.material(&tick, CAMERA_SHADER, 18.0, heavy_ss, demo_params);
 
-        let row = ROW_SHADERS
-            .iter()
-            .map(|(name, radius, height)| self.shader_tile(&tick, name, *radius, *height, 1));
+        let row = ROW_SHADERS.iter().map(|(name, radius, height)| {
+            self.shader_tile(&tick, name, *radius, *height, 1, no_params)
+        });
         let extreme_row = EXTREME_SHADERS.iter().map(|(name, radius, height)| {
-            self.shader_tile(&tick, name, *radius, *height, heavy_ss)
+            self.shader_tile(&tick, name, *radius, *height, heavy_ss, demo_params)
         });
         let crazier_row = CRAZIER_SHADERS.iter().map(|(name, radius, height)| {
-            self.shader_tile(&tick, name, *radius, *height, heavy_ss)
+            self.shader_tile(&tick, name, *radius, *height, heavy_ss, demo_params)
         });
 
+        let params_label = if self.params_demo {
+            "params on"
+        } else {
+            "params off"
+        };
         let fps_label = SharedString::from(format!(
-            "{:>5.1} fps  ·  frame {}  ·  t {:>5.2}s  ·  tiles {}x  ·  ss {}x",
-            self.smoothed_fps, tick.frame, self.last_time_seconds, self.tile_scale, heavy_ss
+            "{:>5.1} fps  ·  frame {}  ·  t {:>5.2}s  ·  tiles {}x  ·  ss {}x  ·  {}",
+            self.smoothed_fps,
+            tick.frame,
+            self.last_time_seconds,
+            self.tile_scale,
+            heavy_ss,
+            params_label,
         ));
 
         div()

@@ -82,6 +82,11 @@ struct ShaderQuadPrimitive {
     date_w: f32,
     _pad2: f32,
     _pad3: f32,
+
+    /// Sixteen app-provided scalars forwarded to WGSL as
+    /// `ShaderQuad.param_0..param_15`. `[f32; 16]` is layout-equivalent to
+    /// 16 sequential `f32`s under `#[repr(C)]`, matching the WGSL struct.
+    params: [f32; 16],
 }
 
 impl ShaderQuadPrimitive {
@@ -120,6 +125,7 @@ impl ShaderQuadPrimitive {
             date_w: date[3],
             _pad2: 0.0,
             _pad3: 0.0,
+            params: shader_quad.material.params,
         })
     }
 }
@@ -140,6 +146,7 @@ fn builtin_variant(name: &str) -> u32 {
         "hyperspace_jump" => 11,
         "ferrofluid" => 12,
         "apollonian_gasket" => 13,
+        "audio_reactive" => 14,
         _ => 0,
     }
 }

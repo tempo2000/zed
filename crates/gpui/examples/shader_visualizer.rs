@@ -1,27 +1,24 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    App, Bounds, Context, Render, ShaderMaterial, ShaderSource, ShaderUniforms, SharedString,
-    Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px, rgb, size,
+    App, Bounds, Context, Render, ShaderMaterial, ShaderSource, SharedString, Window, WindowBounds,
+    WindowOptions, canvas, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
 const TRACK_LENGTH_SECONDS: f32 = 240.0;
-const PEAK_COUNT: usize = 64;
-const LAYOUT_HASH: u64 = 0x0A17_BEEF;
+/// Number of "FFT" bands fed into the `audio_reactive` shader. Matches the
+/// 16 scalar params slot on `ShaderMaterial`.
+const BAND_COUNT: usize = 16;
 
 struct ShaderVisualizer {
     started_at: Instant,
     now_playing: SharedString,
     artist: SharedString,
     progress: f32,
-    bass: f32,
-    mid: f32,
-    treble: f32,
-    peaks: Vec<f32>,
+    bands: [f32; BAND_COUNT],
 }
 
 impl ShaderVisualizer {
@@ -31,44 +28,23 @@ impl ShaderVisualizer {
             now_playing: SharedString::from("Aurora Drift"),
             artist: SharedString::from("Lumen Trails"),
             progress: 0.0,
-            bass: 0.0,
-            mid: 0.0,
-            treble: 0.0,
-            peaks: vec![0.0; PEAK_COUNT],
+            bands: [0.0; BAND_COUNT],
         }
     }
 
     fn update_signals(&mut self, time: f32) {
         self.progress = (time % TRACK_LENGTH_SECONDS) / TRACK_LENGTH_SECONDS;
 
-        let bass = 0.5 + 0.5 * (time * 1.7).sin();
-        let mid = 0.5 + 0.5 * (time * 2.3 + 1.2).cos();
-        let treble = 0.5 + 0.5 * (time * 3.1 + 2.4).sin() * (time * 0.9).cos();
-
-        self.bass = bass.clamp(0.0, 1.0);
-        self.mid = mid.clamp(0.0, 1.0);
-        self.treble = treble.clamp(0.0, 1.0);
-
-        for (index, peak) in self.peaks.iter_mut().enumerate() {
-            let normalized = index as f32 / PEAK_COUNT as f32;
-            let value = 0.5
-                + 0.5
-                    * ((time * 2.0 + normalized * 12.0).sin()
-                        * (time * 0.7 + normalized * 4.0).cos());
-            *peak = value.clamp(0.0, 1.0);
+        // Synthesize 16 frequency bands. Lower bands beat slower and harder,
+        // higher bands flicker faster, so the result reads as music-like.
+        for (index, band) in self.bands.iter_mut().enumerate() {
+            let n = index as f32;
+            let frequency = 0.6 + 0.18 * n;
+            let envelope = (-0.04 * n).exp().max(0.15);
+            let beat = 0.5 + 0.5 * (time * frequency + n * 0.7).sin();
+            let shimmer = 0.25 * (time * 6.0 + n * 1.5).sin();
+            *band = (envelope * beat + shimmer * 0.4 + 0.05).clamp(0.0, 1.0);
         }
-    }
-
-    fn build_uniform_bytes(&self, time: f32) -> Arc<[u8]> {
-        let mut buffer: Vec<u8> = Vec::with_capacity((6 + PEAK_COUNT) * 4);
-        let scalars = [time, self.progress, self.bass, self.mid, self.treble, 0.0];
-        for value in scalars {
-            buffer.extend_from_slice(&value.to_ne_bytes());
-        }
-        for peak in &self.peaks {
-            buffer.extend_from_slice(&peak.to_ne_bytes());
-        }
-        Arc::from(buffer.into_boxed_slice())
     }
 
     fn shader_material(
@@ -79,12 +55,22 @@ impl ShaderVisualizer {
     ) -> ShaderMaterial {
         ShaderMaterial {
             shader: ShaderSource::BuiltIn(SharedString::from(shader_name)),
-            uniforms: ShaderUniforms {
-                bytes: self.build_uniform_bytes(time),
-                layout_hash: LAYOUT_HASH,
-            },
             corner_radii: px(corner_radius).into(),
             time,
+            ..Default::default()
+        }
+    }
+
+    /// Build a material whose `params` slot carries the current 16-band
+    /// "spectrum". `audio_reactive` reads each band as a vertical bar
+    /// height; other variants would see them as palette/intensity hints
+    /// via the dispatcher's post-pass.
+    fn audio_reactive_material(&self, time: f32, corner_radius: f32) -> ShaderMaterial {
+        ShaderMaterial {
+            shader: ShaderSource::BuiltIn(SharedString::from("audio_reactive")),
+            corner_radii: px(corner_radius).into(),
+            time,
+            params: self.bands,
             ..Default::default()
         }
     }
@@ -105,7 +91,7 @@ impl Render for ShaderVisualizer {
         self.update_signals(time);
 
         let main_material = self.shader_material("warp_field", time, 18.0);
-        let bars_material = self.shader_material("spectrum_bars", time, 10.0);
+        let bars_material = self.audio_reactive_material(time, 10.0);
         let grid_material = self.shader_material("wave_grid", time, 10.0);
         let plasma_material = self.shader_material("plasma", time, 10.0);
         let seek_material = self.shader_material("ribbon", time, 4.0);
