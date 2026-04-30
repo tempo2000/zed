@@ -835,6 +835,7 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
+                PrimitiveBatch::ShaderQuads(_) => true,
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,

@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, SharedString, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -36,6 +37,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub shader_quads: Vec<ShaderQuad>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +54,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.shader_quads.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +122,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::ShaderQuad(shader_quad) => {
+                shader_quad.order = order;
+                self.shader_quads.push(shader_quad.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +153,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.shader_quads
+            .sort_by_key(|shader_quad| shader_quad.order);
     }
 
     #[cfg_attr(
@@ -173,6 +182,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            shader_quads_start: 0,
+            shader_quads_iter: self.shader_quads.iter().peekable(),
         }
     }
 }
@@ -189,6 +200,7 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    ShaderQuad,
     Path,
     Underline,
     MonochromeSprite,
@@ -214,6 +226,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    ShaderQuad(ShaderQuad),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +241,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::ShaderQuad(shader_quad) => &shader_quad.bounds,
         }
     }
 
@@ -241,6 +255,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::ShaderQuad(shader_quad) => &shader_quad.content_mask,
         }
     }
 }
@@ -269,6 +284,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    shader_quads_start: usize,
+    shader_quads_iter: Peekable<slice::Iter<'a, ShaderQuad>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +318,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.shader_quads_iter.peek().map(|s| s.order),
+                PrimitiveKind::ShaderQuad,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +468,14 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::ShaderQuad => {
+                let shader_quads_start = self.shader_quads_start;
+                self.shader_quads_iter.next();
+                self.shader_quads_start += 1;
+                Some(PrimitiveBatch::ShaderQuads(
+                    shader_quads_start..self.shader_quads_start,
+                ))
+            }
         }
     }
 }
@@ -479,6 +508,118 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    ShaderQuads(Range<usize>),
+}
+
+/// Generic material data for a shader-filled rectangle.
+///
+/// Extra fields mirror Shadertoy's standard inputs so downstream shaders can be
+/// ported without rewiring uniforms. Renderer support for runtime shader source
+/// is added in later milestones.
+#[derive(Clone, Debug)]
+pub struct ShaderMaterial {
+    /// The shader program to use for rendering.
+    pub shader: ShaderSource,
+    /// App-provided uniform bytes. The first renderer slice ignores these for built-in shaders.
+    pub uniforms: ShaderUniforms,
+    /// Corner radii applied to the shader-filled rectangle.
+    pub corner_radii: Corners<Pixels>,
+    /// Monotonic time, in seconds, exposed as `iTime`.
+    pub time: f32,
+    /// Time, in seconds, since the previous frame, exposed as `iTimeDelta`.
+    pub time_delta: f32,
+    /// Frame index, exposed as `iFrame`.
+    pub frame: u32,
+    /// Mouse state in shader-quad pixels: `[x, y, click_x, click_y]`, exposed as `iMouse`.
+    pub mouse: [f32; 4],
+    /// Wall-clock components: `[year, month, day, seconds]`, exposed as `iDate`.
+    pub date: [f32; 4],
+    /// Per-pixel supersample factor applied by heavy variants. Allowed
+    /// values are `1`, `2`, or `4`; renderers clamp out-of-range values.
+    /// Default `1` (no supersampling) keeps the cost identical to before.
+    pub supersample: u32,
+}
+
+impl Default for ShaderMaterial {
+    fn default() -> Self {
+        Self {
+            shader: ShaderSource::default(),
+            uniforms: ShaderUniforms::default(),
+            corner_radii: Corners::default(),
+            time: 0.0,
+            time_delta: 0.0,
+            frame: 0,
+            mouse: [0.0; 4],
+            date: [0.0; 4],
+            supersample: 1,
+        }
+    }
+}
+
+/// Source identity for a shader material.
+#[derive(Clone, Debug)]
+pub enum ShaderSource {
+    /// A renderer-provided shader identified by name.
+    BuiltIn(SharedString),
+    /// Runtime source provided by the app. Renderer support is added incrementally.
+    Runtime {
+        /// Stable app-provided id used for caching.
+        id: SharedString,
+        /// Shader source text.
+        source: Arc<str>,
+        /// Source language.
+        language: ShaderLanguage,
+    },
+}
+
+/// Source languages accepted by the public shader API.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ShaderLanguage {
+    /// WebGPU Shading Language.
+    #[default]
+    Wgsl,
+    /// GLSL fragment source. Not supported by the first renderer slice.
+    GlslFragment,
+    /// Shadertoy-style GLSL fragment source. Not supported by the first renderer slice.
+    ShadertoyGlsl,
+}
+
+impl Default for ShaderSource {
+    fn default() -> Self {
+        Self::BuiltIn(SharedString::from("default"))
+    }
+}
+
+/// Opaque uniform bytes supplied by an app.
+#[derive(Clone, Debug, Default)]
+pub struct ShaderUniforms {
+    /// Uniform byte payload.
+    pub bytes: Arc<[u8]>,
+    /// App-defined layout hash used by renderers for future pipeline/cache validation.
+    pub layout_hash: u64,
+}
+
+/// A rectangle filled by a shader program.
+#[derive(Clone, Debug)]
+pub struct ShaderQuad {
+    /// Scene draw order.
+    pub order: DrawOrder,
+    /// Device-scaled rectangle bounds.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Current content mask.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corner radii in device-scaled pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Element opacity applied to the shader output.
+    pub opacity: f32,
+    /// Shader material.
+    pub material: ShaderMaterial,
+}
+
+impl From<ShaderQuad> for Primitive {
+    fn from(shader_quad: ShaderQuad) -> Self {
+        Primitive::ShaderQuad(shader_quad)
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone)]

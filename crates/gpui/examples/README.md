@@ -47,6 +47,7 @@ cargo run -p gpui --example hello_world
 - `image_gallery` demonstrates image caching and loading remote images.
 - `image_loading` shows image loading states and asset loading.
 - `painting` demonstrates custom drawing with paths and canvas.
+- `shader_quad` demonstrates the low-level shader-filled rectangle paint API.
 - `svg` shows SVG rendering.
 
 ## Windows and application behavior

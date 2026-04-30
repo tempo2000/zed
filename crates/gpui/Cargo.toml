@@ -212,6 +212,14 @@ name = "shadow"
 path = "examples/shadow.rs"
 
 [[example]]
+name = "shader_quad"
+path = "examples/shader_quad.rs"
+
+[[example]]
+name = "shader_visualizer"
+path = "examples/shader_visualizer.rs"
+
+[[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
 

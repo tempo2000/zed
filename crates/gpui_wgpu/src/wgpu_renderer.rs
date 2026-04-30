@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, ShaderQuad, ShaderSource, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -42,6 +42,106 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+// Layout mirrors the WGSL `ShaderQuad` struct field for field. We avoid
+// vec3/vec4 typed members on the WGSL side because storage-buffer alignment
+// rounds those to 16 bytes, which would silently misalign against `#[repr(C)]`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShaderQuadPrimitive {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    corner_radius_tl: f32,
+    corner_radius_tr: f32,
+    corner_radius_br: f32,
+    corner_radius_bl: f32,
+    opacity: f32,
+    variant: u32,
+    /// Supersample factor (1, 2, or 4) forwarded to heavy WGSL variants. Set
+    /// from `ShaderMaterial::supersample`.
+    supersample: u32,
+    _pad1: u32,
+
+    resolution_x: f32,
+    resolution_y: f32,
+    resolution_z: f32,
+    time: f32,
+
+    time_delta: f32,
+    frame: f32,
+    mouse_x: f32,
+    mouse_y: f32,
+
+    mouse_z: f32,
+    mouse_w: f32,
+    date_x: f32,
+    date_y: f32,
+
+    date_z: f32,
+    date_w: f32,
+    _pad2: f32,
+    _pad3: f32,
+}
+
+impl ShaderQuadPrimitive {
+    fn from_shader_quad(shader_quad: &ShaderQuad) -> Option<Self> {
+        let ShaderSource::BuiltIn(ref name) = shader_quad.material.shader else {
+            return None;
+        };
+        let width = shader_quad.bounds.size.width.0;
+        let height = shader_quad.bounds.size.height.0;
+        let mouse = shader_quad.material.mouse;
+        let date = shader_quad.material.date;
+        Some(Self {
+            bounds: shader_quad.bounds.into(),
+            content_mask: shader_quad.content_mask.bounds.into(),
+            corner_radius_tl: shader_quad.corner_radii.top_left.0,
+            corner_radius_tr: shader_quad.corner_radii.top_right.0,
+            corner_radius_br: shader_quad.corner_radii.bottom_right.0,
+            corner_radius_bl: shader_quad.corner_radii.bottom_left.0,
+            opacity: shader_quad.opacity,
+            variant: builtin_variant(name),
+            supersample: shader_quad.material.supersample.clamp(1, 4),
+            _pad1: 0,
+            resolution_x: width,
+            resolution_y: height,
+            resolution_z: 1.0,
+            time: shader_quad.material.time,
+            time_delta: shader_quad.material.time_delta,
+            frame: shader_quad.material.frame as f32,
+            mouse_x: mouse[0],
+            mouse_y: mouse[1],
+            mouse_z: mouse[2],
+            mouse_w: mouse[3],
+            date_x: date[0],
+            date_y: date[1],
+            date_z: date[2],
+            date_w: date[3],
+            _pad2: 0.0,
+            _pad3: 0.0,
+        })
+    }
+}
+
+fn builtin_variant(name: &str) -> u32 {
+    match name {
+        "plasma" => 0,
+        "ribbon" => 1,
+        "wave_grid" => 2,
+        "spectrum_bars" => 3,
+        "warp_field" => 4,
+        "camera" => 5,
+        "volumetric_clouds" => 6,
+        "mandelbulb" => 7,
+        "kifs_temple" => 8,
+        "tunnel_warp" => 9,
+        "black_hole" => 10,
+        "hyperspace_jump" => 11,
+        "ferrofluid" => 12,
+        "apollonian_gasket" => 13,
+        _ => 0,
+    }
 }
 
 #[repr(C)]
@@ -90,6 +190,7 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    shader_quads: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -330,15 +431,56 @@ impl WgpuRenderer {
             );
         }
 
+        // Honor `GPUI_PRESENT_MODE` so apps and examples can disable vsync
+        // without changing platform plumbing. Recognized values:
+        //   "fifo"      → vsync (default)
+        //   "mailbox"   → triple-buffered, no tearing, runs as fast as possible
+        //   "immediate" → no vsync, allows tearing
+        //   "auto"      → mailbox if supported, else immediate, else fifo
+        // The variable wins over `preferred_present_mode` when set.
+        let env_present_mode = std::env::var("GPUI_PRESENT_MODE")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase());
+        let env_resolved = env_present_mode.as_deref().and_then(|name| match name {
+            "fifo" => Some(wgpu::PresentMode::Fifo),
+            "mailbox" => surface_caps
+                .present_modes
+                .contains(&wgpu::PresentMode::Mailbox)
+                .then_some(wgpu::PresentMode::Mailbox),
+            "immediate" => surface_caps
+                .present_modes
+                .contains(&wgpu::PresentMode::Immediate)
+                .then_some(wgpu::PresentMode::Immediate),
+            "auto" => {
+                if surface_caps
+                    .present_modes
+                    .contains(&wgpu::PresentMode::Mailbox)
+                {
+                    Some(wgpu::PresentMode::Mailbox)
+                } else if surface_caps
+                    .present_modes
+                    .contains(&wgpu::PresentMode::Immediate)
+                {
+                    Some(wgpu::PresentMode::Immediate)
+                } else {
+                    Some(wgpu::PresentMode::Fifo)
+                }
+            }
+            _ => None,
+        });
+
+        let resolved_present_mode = env_resolved
+            .or(config
+                .preferred_present_mode
+                .filter(|mode| surface_caps.present_modes.contains(mode)))
+            .unwrap_or(wgpu::PresentMode::Fifo);
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            present_mode: resolved_present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
@@ -865,6 +1007,18 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let shader_quads = create_pipeline(
+            "shader_quads",
+            "vs_shader_quad",
+            "fs_shader_quad",
+            &layouts.globals,
+            &layouts.instances,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -886,6 +1040,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            shader_quads,
             surfaces,
         }
     }
@@ -1299,6 +1454,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
+                        PrimitiveBatch::ShaderQuads(range) => self.draw_shader_quads(
+                            &scene.shader_quads[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
@@ -1443,6 +1603,31 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_shader_quads(
+        &self,
+        shader_quads: &[ShaderQuad],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        for shader_quad in shader_quads {
+            let Some(instance) = ShaderQuadPrimitive::from_shader_quad(shader_quad) else {
+                continue;
+            };
+
+            if !self.draw_instances(
+                bytemuck::bytes_of(&instance),
+                1,
+                &self.resources().pipelines.shader_quads,
+                instance_offset,
+                pass,
+            ) {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_instances(
